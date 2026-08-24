@@ -1,0 +1,615 @@
+"""
+==============================================================================
+PORTFOLIO RISK SYNTHESIZER
+An agentic RAG system that analyzes investment portfolios for concentration
+risk, sector imbalance, and regulatory red flags using LangGraph + RAG.
+==============================================================================
+
+WHY THIS PROJECT (for interviews):
+    Most "RAG chatbot" projects are a single retrieve -> generate chain.
+    This one is a multi-step AGENT: it retrieves evidence from fund
+    documents + regulatory text, runs deterministic risk checks, branches
+    based on what it finds (a real conditional edge, not just decoration),
+    and only then asks an LLM to synthesize everything into a report that
+    is grounded in the retrieved evidence and the computed numbers.
+
+ARCHITECTURE (LangGraph state machine):
+
+    parse_portfolio
+          |
+          v
+    retrieve_context  <-- RAG: TF-IDF retrieval over fund docs + regulation docs
+          |
+          v
+    run_risk_checks    <-- deterministic: concentration + sector concentration
+          |
+          v
+    regulatory_check   <-- RAG-grounded: matches holdings against retrieved
+          |               regulation snippets
+          v
+    [conditional edge] -- if any HIGH severity flag -> escalate_node
+          |                                              |
+          | (else)                                       v
+          v                                        escalate_node
+    synthesize_report  <-------------------------------- |
+          |
+          v
+         END
+
+WHY TF-IDF INSTEAD OF NEURAL EMBEDDINGS:
+    A deliberate engineering trade-off, not a limitation I was unaware of.
+    Fund documents use precise, repeated vocabulary (fund names, sector
+    labels, regulation clause numbers) where lexical overlap retrieval
+    (TF-IDF / cosine similarity) is fast, needs no model download or GPU,
+    and is easy to reason about and unit-test. In an interview you can say:
+    "I used TF-IDF retrieval because the domain vocabulary is precise and
+    it kept the system dependency-light; swapping in HuggingFaceEmbeddings
+    or OpenAIEmbeddings behind the same VectorStore interface is a one
+    line change -- see `SimpleVectorStore`." That's a legitimate, defensible
+    answer to "why didn't you use real embeddings?"
+
+WHY THE LLM STEP IS OPTIONAL (GRACEFUL DEGRADATION):
+    The report-synthesis node calls Anthropic's API if ANTHROPIC_API_KEY is
+    set, and otherwise falls back to a deterministic template built from
+    the same evidence. This means the whole pipeline is always demoable
+    live, with or without an API key, and it's a legitimate production
+    pattern (never let an optional enrichment step take down the pipeline).
+
+SETUP:
+    pip install langgraph langchain-core anthropic scikit-learn numpy
+    export ANTHROPIC_API_KEY=sk-...      # optional, enables LLM narrative
+
+RUN:
+    python portfolio_risk_synthesizer.py            # demo on one portfolio
+    python portfolio_risk_synthesizer.py --evaluate  # run the test suite
+==============================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypedDict
+
+import numpy as np
+from langchain_core.documents import Document
+from langgraph.graph import END, StateGraph
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ==============================================================================
+# 1. KNOWLEDGE BASE (mock fund documents + mock regulatory text)
+#
+# In a real deployment these would be parsed from uploaded PDFs (fund
+# factsheets, prospectuses, SEBI circulars) via a PDF-parsing step. They are
+# inlined here as plain text so the whole project runs with zero external
+# files. The regulatory text below is ILLUSTRATIVE / SIMPLIFIED for the
+# purpose of this portfolio project -- it mimics the shape of real SEBI
+# concentration and categorization norms but is not a verbatim reproduction
+# of any actual circular, and should not be used for real compliance work.
+# ==============================================================================
+
+FUND_DOCS: dict[str, str] = {
+    "AlphaTech Growth Fund": (
+        "AlphaTech Growth Fund is an equity-oriented scheme investing at least "
+        "80% of assets in technology and IT services companies. Category: "
+        "Sectoral/Thematic Fund. As per scheme mandate, single-stock exposure "
+        "is capped at 10% of NAV. The fund has historically run a concentrated "
+        "top-5-holdings weight above 45%. Benchmark: Nifty IT."
+    ),
+    "SteadyBond Income Fund": (
+        "SteadyBond Income Fund is a debt scheme investing in AA and above "
+        "rated corporate bonds and government securities. Category: "
+        "Corporate Bond Fund. Average maturity 4.2 years. Single-issuer "
+        "exposure capped at 15% of NAV per scheme mandate. No equity exposure."
+    ),
+    "EnergyEdge Sector Fund": (
+        "EnergyEdge Sector Fund is a sectoral equity fund investing in energy, "
+        "oil & gas, and power generation companies. Category: Sectoral/"
+        "Thematic Fund. Sectoral funds carry higher concentration risk by "
+        "design and are suitable only for investors with high sector "
+        "conviction. Single-stock exposure capped at 10% of NAV."
+    ),
+    "BalancedCore Hybrid Fund": (
+        "BalancedCore Hybrid Fund is an aggressive hybrid scheme investing "
+        "65-80% in equity and the remainder in debt instruments. Category: "
+        "Hybrid Fund. Diversified across sectors with no single sector "
+        "exceeding 25% of equity allocation per internal risk policy."
+    ),
+}
+
+REGULATION_DOCS: dict[str, str] = {
+    "SEBI Concentration Norms (illustrative)": (
+        "Mutual fund schemes shall ensure that exposure to a single company "
+        "does not exceed 10% of NAV for equity schemes, except sectoral or "
+        "thematic schemes where scheme-specific limits disclosed in the "
+        "Scheme Information Document apply. Debt schemes shall limit "
+        "single-issuer exposure to 10-15% of NAV depending on credit rating, "
+        "subject to Board approval for exceptions."
+    ),
+    "SEBI Sectoral Fund Risk Disclosure (illustrative)": (
+        "Sectoral and thematic funds are inherently concentrated by "
+        "construction and carry higher volatility and concentration risk "
+        "than diversified equity schemes. AMCs must disclose this "
+        "concentration risk prominently in scheme documents and must not "
+        "market such schemes as suitable for conservative investors."
+    ),
+    "SEBI Scheme Categorization Circular (illustrative)": (
+        "Every scheme must be classified into one of the defined categories "
+        "(e.g., Large Cap, Sectoral/Thematic, Corporate Bond, Hybrid). An "
+        "AMC misrepresenting a sectoral scheme as diversified equity, or a "
+        "hybrid scheme exceeding its disclosed equity band, is a "
+        "categorization compliance violation requiring disclosure to "
+        "investors and corrective filing."
+    ),
+}
+
+
+# ==============================================================================
+# 2. LIGHTWEIGHT RAG: TF-IDF VECTOR STORE
+#
+# Conforms to a minimal (add_documents / similarity_search) interface so it
+# can be swapped for a LangChain-native VectorStore (Chroma, FAISS +
+# HuggingFaceEmbeddings) without touching any graph node -- only this class
+# changes.
+# ==============================================================================
+
+
+class SimpleVectorStore:
+    """TF-IDF + cosine-similarity retriever with a VectorStore-like API."""
+
+    def __init__(self, documents: list[Document]):
+        self.documents = documents
+        texts = [d.page_content for d in documents]
+        self.vectorizer = TfidfVectorizer(stop_words="english")
+        self.matrix = self.vectorizer.fit_transform(texts)
+
+    def similarity_search(self, query: str, k: int = 2) -> list[Document]:
+        query_vec = self.vectorizer.transform([query])
+        scores = cosine_similarity(query_vec, self.matrix).flatten()
+        top_idx = np.argsort(scores)[::-1][:k]
+        return [self.documents[i] for i in top_idx if scores[i] > 0]
+
+
+def _build_store(raw_docs: dict[str, str]) -> SimpleVectorStore:
+    docs = [Document(page_content=text, metadata={"source": name}) for name, text in raw_docs.items()]
+    return SimpleVectorStore(docs)
+
+
+FUND_STORE = _build_store(FUND_DOCS)
+REGULATION_STORE = _build_store(REGULATION_DOCS)
+
+
+# ==============================================================================
+# 3. GRAPH STATE + DATA MODELS
+# ==============================================================================
+
+
+@dataclass
+class Holding:
+    fund_name: str
+    weight_pct: float  # % of portfolio NAV
+    sector: str
+
+
+@dataclass
+class RiskFlag:
+    category: Literal["concentration", "sector", "regulatory"]
+    severity: Literal["LOW", "MEDIUM", "HIGH"]
+    message: str
+    evidence: str = ""
+
+
+class GraphState(TypedDict):
+    holdings: list[Holding]
+    retrieved_fund_docs: dict[str, list[str]]
+    retrieved_regulation_docs: list[str]
+    flags: list[RiskFlag]
+    escalated: bool
+    report: str
+
+
+# ==============================================================================
+# 4. GRAPH NODES
+# ==============================================================================
+
+CONCENTRATION_THRESHOLD = 40.0  # % of NAV in a single fund
+SECTOR_THRESHOLD = 50.0  # % of NAV in a single sector
+
+
+def parse_portfolio(state: GraphState) -> GraphState:
+    """Entry node. In production this would validate/normalize uploaded
+    holdings data (e.g., from a CSV or extracted PDF table)."""
+    total = sum(h.weight_pct for h in state["holdings"])
+    if abs(total - 100.0) > 0.5:
+        # Real systems shouldn't silently swallow bad input -- surface it as
+        # a flag rather than crashing the graph.
+        state.setdefault("flags", [])
+        state["flags"].append(
+            RiskFlag(
+                category="concentration",
+                severity="LOW",
+                message=f"Portfolio weights sum to {total:.1f}%, not 100% -- input data may be incomplete.",
+            )
+        )
+    return state
+
+
+def retrieve_context(state: GraphState) -> GraphState:
+    """RAG step: for every holding, retrieve the most relevant fund
+    document and the most relevant regulatory snippets."""
+    retrieved_fund_docs: dict[str, list[str]] = {}
+    retrieved_reg_docs: set[str] = set()
+
+    for h in state["holdings"]:
+        fund_hits = FUND_STORE.similarity_search(h.fund_name, k=1)
+        retrieved_fund_docs[h.fund_name] = [d.page_content for d in fund_hits]
+
+        reg_query = f"{h.sector} sector fund concentration exposure limit"
+        reg_hits = REGULATION_STORE.similarity_search(reg_query, k=2)
+        for d in reg_hits:
+            retrieved_reg_docs.add(d.page_content)
+
+    state["retrieved_fund_docs"] = retrieved_fund_docs
+    state["retrieved_regulation_docs"] = list(retrieved_reg_docs)
+    return state
+
+
+def run_risk_checks(state: GraphState) -> GraphState:
+    """Deterministic quantitative checks. Kept out of the LLM entirely on
+    purpose -- arithmetic should never be delegated to a language model."""
+    flags = state.get("flags", [])
+
+    for h in state["holdings"]:
+        if h.weight_pct >= CONCENTRATION_THRESHOLD:
+            flags.append(
+                RiskFlag(
+                    category="concentration",
+                    severity="HIGH" if h.weight_pct >= 55 else "MEDIUM",
+                    message=(
+                        f"{h.fund_name} makes up {h.weight_pct:.1f}% of the portfolio, "
+                        f"above the {CONCENTRATION_THRESHOLD:.0f}% single-fund concentration threshold."
+                    ),
+                    evidence=", ".join(state["retrieved_fund_docs"].get(h.fund_name, [])),
+                )
+            )
+
+    sector_totals: dict[str, float] = {}
+    for h in state["holdings"]:
+        sector_totals[h.sector] = sector_totals.get(h.sector, 0.0) + h.weight_pct
+
+    for sector, total in sector_totals.items():
+        if total >= SECTOR_THRESHOLD:
+            flags.append(
+                RiskFlag(
+                    category="sector",
+                    severity="HIGH" if total >= 70 else "MEDIUM",
+                    message=(
+                        f"Sector '{sector}' accounts for {total:.1f}% of the portfolio, "
+                        f"above the {SECTOR_THRESHOLD:.0f}% sector concentration threshold."
+                    ),
+                )
+            )
+
+    state["flags"] = flags
+    return state
+
+
+def regulatory_check(state: GraphState) -> GraphState:
+    """RAG-grounded check: does the retrieved regulatory text imply an
+    issue with what was retrieved about the fund itself?
+    This is intentionally simple keyword/context matching -- the point for
+    the interview story is that flags are traced back to a retrieved
+    document, not invented by an LLM."""
+    flags = state.get("flags", [])
+    reg_text_blob = " ".join(state["retrieved_regulation_docs"]).lower()
+
+    for h in state["holdings"]:
+        fund_text_blob = " ".join(state["retrieved_fund_docs"].get(h.fund_name, [])).lower()
+        is_sectoral = "sectoral" in fund_text_blob or "thematic" in fund_text_blob
+        if is_sectoral and h.weight_pct >= CONCENTRATION_THRESHOLD and "concentration risk" in reg_text_blob:
+            flags.append(
+                RiskFlag(
+                    category="regulatory",
+                    severity="MEDIUM",
+                    message=(
+                        f"{h.fund_name} is a sectoral/thematic scheme held at {h.weight_pct:.1f}% of "
+                        "NAV. Regulatory guidance requires such concentration risk to be prominently "
+                        "disclosed and flags it as unsuitable for conservative investors."
+                    ),
+                    evidence="SEBI Sectoral Fund Risk Disclosure (illustrative)",
+                )
+            )
+        if "hybrid" in fund_text_blob and "categorization" in reg_text_blob and h.weight_pct >= 60:
+            flags.append(
+                RiskFlag(
+                    category="regulatory",
+                    severity="HIGH",
+                    message=(
+                        f"{h.fund_name} is a hybrid scheme but is held at a weight that, combined "
+                        "with its equity band, warrants a categorization compliance review."
+                    ),
+                    evidence="SEBI Scheme Categorization Circular (illustrative)",
+                )
+            )
+
+    state["flags"] = flags
+    return state
+
+
+def route_after_regulatory_check(state: GraphState) -> str:
+    """The one real conditional edge in the graph: HIGH-severity findings
+    get routed through an escalation node before synthesis; everything
+    else goes straight to the report."""
+    if any(f.severity == "HIGH" for f in state["flags"]):
+        return "escalate"
+    return "synthesize"
+
+
+def escalate_node(state: GraphState) -> GraphState:
+    """Adds an explicit action recommendation for HIGH severity flags.
+    Kept separate from synthesize_report so the branch is visible in the
+    graph, not just an if-statement buried inside one big node."""
+    state["escalated"] = True
+    high_flags = [f for f in state["flags"] if f.severity == "HIGH"]
+    for f in high_flags:
+        f.message += " [ESCALATED: recommend immediate rebalancing review before next disclosure cycle.]"
+    return state
+
+
+def synthesize_report(state: GraphState) -> GraphState:
+    """Turns flags + evidence into a human-readable report. Uses Claude if
+    ANTHROPIC_API_KEY is set; otherwise falls back to a deterministic
+    template built from the exact same structured data, so the pipeline
+    output is always available and always evidence-grounded."""
+    flags = state["flags"]
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    if api_key:
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+            flags_json = json.dumps([f.__dict__ for f in flags], indent=2)
+            prompt = (
+                "You are a portfolio risk analyst. Using ONLY the structured "
+                "risk flags below (do not invent numbers or funds not listed), "
+                "write a concise risk report with a one-line summary, then a "
+                "bulleted breakdown per flag, then one actionable recommendation "
+                f"per HIGH severity flag.\n\nFLAGS:\n{flags_json}"
+            )
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=800,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            state["report"] = "".join(
+                block.text for block in response.content if getattr(block, "type", "") == "text"
+            )
+            return state
+        except Exception as exc:  # graceful degradation, never crash the pipeline
+            fallback_note = f"[LLM synthesis unavailable ({exc}); using template report]\n\n"
+    else:
+        fallback_note = "[No ANTHROPIC_API_KEY set; using template report]\n\n"
+
+    lines = [fallback_note.strip(), "", "PORTFOLIO RISK REPORT", "=" * 40]
+    if not flags:
+        lines.append("No risk flags identified. Portfolio appears within configured thresholds.")
+    else:
+        by_severity = {"HIGH": [], "MEDIUM": [], "LOW": []}
+        for f in flags:
+            by_severity[f.severity].append(f)
+        for sev in ["HIGH", "MEDIUM", "LOW"]:
+            if not by_severity[sev]:
+                continue
+            lines.append(f"\n{sev} SEVERITY ({len(by_severity[sev])}):")
+            for f in by_severity[sev]:
+                lines.append(f"  - [{f.category}] {f.message}")
+                if f.evidence:
+                    lines.append(f"      evidence: {f.evidence[:140]}...")
+    state["report"] = "\n".join(lines)
+    return state
+
+
+# ==============================================================================
+# 5. BUILD THE GRAPH
+# ==============================================================================
+
+
+def build_graph():
+    graph = StateGraph(GraphState)
+    graph.add_node("parse_portfolio", parse_portfolio)
+    graph.add_node("retrieve_context", retrieve_context)
+    graph.add_node("run_risk_checks", run_risk_checks)
+    graph.add_node("regulatory_check", regulatory_check)
+    graph.add_node("escalate_node", escalate_node)
+    graph.add_node("synthesize_report", synthesize_report)
+
+    graph.set_entry_point("parse_portfolio")
+    graph.add_edge("parse_portfolio", "retrieve_context")
+    graph.add_edge("retrieve_context", "run_risk_checks")
+    graph.add_edge("run_risk_checks", "regulatory_check")
+    graph.add_conditional_edges(
+        "regulatory_check",
+        route_after_regulatory_check,
+        {"escalate": "escalate_node", "synthesize": "synthesize_report"},
+    )
+    graph.add_edge("escalate_node", "synthesize_report")
+    graph.add_edge("synthesize_report", END)
+
+    return graph.compile()
+
+
+APP = build_graph()
+
+
+def analyze_portfolio(holdings: list[Holding]) -> GraphState:
+    initial_state: GraphState = {
+        "holdings": holdings,
+        "retrieved_fund_docs": {},
+        "retrieved_regulation_docs": [],
+        "flags": [],
+        "escalated": False,
+        "report": "",
+    }
+    return APP.invoke(initial_state)
+
+
+# ==============================================================================
+# 6. EVALUATION SUITE
+#
+# Deterministic test portfolios with known expected flag categories. This is
+# the piece most placement projects skip -- it turns "trust me, it works"
+# into a number you can defend in an interview.
+# ==============================================================================
+
+
+@dataclass
+class TestCase:
+    name: str
+    holdings: list[Holding]
+    expected_categories: set[str]  # which flag categories SHOULD fire
+    expect_escalation: bool
+
+
+TEST_CASES: list[TestCase] = [
+    TestCase(
+        name="High concentration in sectoral tech fund",
+        holdings=[
+            Holding("AlphaTech Growth Fund", 60.0, "Technology"),
+            Holding("SteadyBond Income Fund", 25.0, "Fixed Income"),
+            Holding("BalancedCore Hybrid Fund", 15.0, "Diversified"),
+        ],
+        expected_categories={"concentration", "sector", "regulatory"},
+        expect_escalation=True,
+    ),
+    TestCase(
+        name="Well-diversified, low-risk portfolio",
+        holdings=[
+            Holding("SteadyBond Income Fund", 35.0, "Fixed Income"),
+            Holding("BalancedCore Hybrid Fund", 35.0, "Diversified"),
+            Holding("AlphaTech Growth Fund", 15.0, "Technology"),
+            Holding("EnergyEdge Sector Fund", 15.0, "Energy"),
+        ],
+        expected_categories=set(),
+        expect_escalation=False,
+    ),
+    TestCase(
+        name="Sector concentration without single-fund breach",
+        holdings=[
+            Holding("AlphaTech Growth Fund", 30.0, "Technology"),
+            Holding("EnergyEdge Sector Fund", 25.0, "Technology"),  # same sector label on purpose
+            Holding("SteadyBond Income Fund", 45.0, "Fixed Income"),
+        ],
+        expected_categories={"sector"},
+        expect_escalation=False,
+    ),
+    TestCase(
+        name="Two concentrated sectoral funds -> escalation expected",
+        holdings=[
+            Holding("EnergyEdge Sector Fund", 58.0, "Energy"),
+            Holding("SteadyBond Income Fund", 42.0, "Fixed Income"),
+        ],
+        expected_categories={"concentration", "sector", "regulatory"},
+        expect_escalation=True,
+    ),
+]
+
+
+def run_evaluation(verbose: bool = True) -> dict[str, Any]:
+    results = []
+    for tc in TEST_CASES:
+        final_state = analyze_portfolio(tc.holdings)
+        fired_categories = {f.category for f in final_state["flags"]}
+
+        true_positives = fired_categories & tc.expected_categories
+        false_positives = fired_categories - tc.expected_categories
+        false_negatives = tc.expected_categories - fired_categories
+
+        precision = len(true_positives) / len(fired_categories) if fired_categories else 1.0
+        recall = len(true_positives) / len(tc.expected_categories) if tc.expected_categories else 1.0
+        escalation_correct = final_state["escalated"] == tc.expect_escalation
+
+        results.append(
+            {
+                "test_case": tc.name,
+                "expected": sorted(tc.expected_categories),
+                "fired": sorted(fired_categories),
+                "false_positives": sorted(false_positives),
+                "false_negatives": sorted(false_negatives),
+                "precision": round(precision, 2),
+                "recall": round(recall, 2),
+                "escalation_expected": tc.expect_escalation,
+                "escalation_actual": final_state["escalated"],
+                "escalation_correct": escalation_correct,
+            }
+        )
+
+    avg_precision = sum(r["precision"] for r in results) / len(results)
+    avg_recall = sum(r["recall"] for r in results) / len(results)
+    escalation_accuracy = sum(r["escalation_correct"] for r in results) / len(results)
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("EVALUATION RESULTS")
+        print("=" * 70)
+        for r in results:
+            print(f"\n[{r['test_case']}]")
+            print(f"  expected categories : {r['expected']}")
+            print(f"  fired categories     : {r['fired']}")
+            if r["false_positives"]:
+                print(f"  false positives      : {r['false_positives']}")
+            if r["false_negatives"]:
+                print(f"  false negatives      : {r['false_negatives']}")
+            print(f"  precision={r['precision']}  recall={r['recall']}  "
+                  f"escalation correct={r['escalation_correct']}")
+        print("\n" + "-" * 70)
+        print(f"AVERAGE PRECISION: {avg_precision:.2f}")
+        print(f"AVERAGE RECALL:    {avg_recall:.2f}")
+        print(f"ESCALATION ROUTING ACCURACY: {escalation_accuracy:.2f}")
+        print("-" * 70)
+
+    return {
+        "results": results,
+        "avg_precision": avg_precision,
+        "avg_recall": avg_recall,
+        "escalation_accuracy": escalation_accuracy,
+    }
+
+
+# ==============================================================================
+# 7. CLI
+# ==============================================================================
+
+
+def demo():
+    sample_portfolio = [
+        Holding("AlphaTech Growth Fund", 55.0, "Technology"),
+        Holding("SteadyBond Income Fund", 25.0, "Fixed Income"),
+        Holding("BalancedCore Hybrid Fund", 20.0, "Diversified"),
+    ]
+    print("Analyzing sample portfolio:")
+    for h in sample_portfolio:
+        print(f"  - {h.fund_name}: {h.weight_pct}% ({h.sector})")
+
+    final_state = analyze_portfolio(sample_portfolio)
+
+    print(f"\nEscalated: {final_state['escalated']}")
+    print(f"Flags raised: {len(final_state['flags'])}")
+    print("\n" + final_state["report"])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Portfolio Risk Synthesizer")
+    parser.add_argument("--evaluate", action="store_true", help="Run the evaluation suite instead of the demo")
+    # parse_known_args (not parse_args) so this also runs cleanly inside
+    # Jupyter/Colab, which injects its own kernel launcher args (e.g. -f
+    # kernel-....json) that argparse would otherwise reject.
+    args, _unknown = parser.parse_known_args()
+
+    if args.evaluate:
+        run_evaluation()
+    else:
+        demo()
